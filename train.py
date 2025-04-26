@@ -3,7 +3,6 @@ from model import build_transformer, Transformer
 from dataset import BilingualDataset, causal_mask # defined in dataset.py
 from config import get_config, get_weights_file_path, latest_weights_file_path
 
-import torchtext.datasets as datasets
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
@@ -287,6 +286,7 @@ def train_model(config):
         }, model_filename)
 
 # 辅助函数定义
+# 三个指标：WER、CER 和 BLEU
 def calculate_wer(predicted, expected):
     transformation = jiwer.Compose([
         jiwer.ToLowerCase(),
