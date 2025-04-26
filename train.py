@@ -1,5 +1,6 @@
-from model import build_transformer
-from dataset import BilingualDataset, causal_mask
+import torch.backends
+from model import build_transformer, Transformer
+from dataset import BilingualDataset, causal_mask # defined in dataset.py
 from config import get_config, get_weights_file_path, latest_weights_file_path
 
 import torchtext.datasets as datasets
@@ -20,17 +21,22 @@ from tokenizers.models import WordLevel
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
-import torchmetrics
+import nltk
+import jiwer
+
 from torch.utils.tensorboard import SummaryWriter
 
-def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
+def greedy_decode(model: Transformer, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
     eos_idx = tokenizer_tgt.token_to_id('[EOS]')
 
     # Precompute the encoder output and reuse it for every step
+    # source 的形状是 (1 seq_len)
     encoder_output = model.encode(source, source_mask)
     # Initialize the decoder input with the sos token
+    # decoder_input 的形状是 (1, 1) （只有 1 个 SOS token）
     decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
+    # 生成目标序列（next token prediction, 贪心解码）
     while True:
         if decoder_input.size(1) == max_len:
             break
@@ -42,8 +48,8 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
         out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
 
         # get next token
-        prob = model.project(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
+        prob = model.project(out[:, -1]) # (1, vocab_size)
+        _, next_word = torch.max(prob, dim=1) # 获取概率最大的 token
         decoder_input = torch.cat(
             [decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1
         )
@@ -51,16 +57,16 @@ def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_
         if next_word == eos_idx:
             break
 
-    return decoder_input.squeeze(0)
+    return decoder_input.squeeze(0) # (1, seq_len) -> (seq_len)
 
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
-    model.eval()
-    count = 0
+def run_validation(model: Transformer, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
+    model.eval() # 设置模型为评估模式
+    count = 0 # 统计验证集中的样本数量
 
-    source_texts = []
-    expected = []
-    predicted = []
+    source_texts = [] # 存储源语言的句子
+    expected = [] # 存储目标语言的句子
+    predicted = [] # 存储预测的目标语言的句子
 
     try:
         # get the console window width
@@ -72,20 +78,19 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
         console_width = 80
 
     with torch.no_grad():
-        for batch in validation_ds:
+        for batch in validation_ds: # 每次迭代 1 个样本，validation 阶段使用的batch_size = 1
             count += 1
             encoder_input = batch["encoder_input"].to(device) # (b, seq_len)
             encoder_mask = batch["encoder_mask"].to(device) # (b, 1, 1, seq_len)
 
             # check that the batch size is 1
-            assert encoder_input.size(
-                0) == 1, "Batch size must be 1 for validation"
+            assert encoder_input.size(0) == 1, "Batch size must be 1 for validation"
 
-            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device) # (seq_len)
 
             source_text = batch["src_text"][0]
             target_text = batch["tgt_text"][0]
-            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
+            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy()) # (seq_len) -> (seq_len), 将模型输出转换为字符串
 
             source_texts.append(source_text)
             expected.append(target_text)
@@ -102,24 +107,23 @@ def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, 
                 break
     
     if writer:
-        # Evaluate the character error rate
-        # Compute the char error rate 
-        metric = torchmetrics.CharErrorRate()
-        cer = metric(predicted, expected)
+        # 使用jiwer计算字符错误率
+        cer = calculate_cer(predicted, expected)
         writer.add_scalar('validation cer', cer, global_step)
         writer.flush()
 
-        # Compute the word error rate
-        metric = torchmetrics.WordErrorRate()
-        wer = metric(predicted, expected)
+        # 使用jiwer计算词错误率
+        wer = calculate_wer(predicted, expected)
         writer.add_scalar('validation wer', wer, global_step)
         writer.flush()
 
-        # Compute the BLEU metric
-        metric = torchmetrics.BLEUScore()
-        bleu = metric(predicted, expected)
-        writer.add_scalar('validation BLEU', bleu, global_step)
-        writer.flush()
+        # 使用NLTK计算BLEU分数
+        try:
+            bleu = calculate_bleu(predicted, expected)
+            writer.add_scalar('validation BLEU', bleu, global_step)
+            writer.flush()
+        except:
+            print("计算BLEU分数时出错")
 
 def get_all_sentences(ds, lang):
     for item in ds:
@@ -129,18 +133,18 @@ def get_or_build_tokenizer(config, ds, lang):
     tokenizer_path = Path(config['tokenizer_file'].format(lang))
     if not Path.exists(tokenizer_path):
         # Most code taken from: https://huggingface.co/docs/tokenizers/quicktour
-        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
-        tokenizer.pre_tokenizer = Whitespace()
-        trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
-        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
-        tokenizer.save(str(tokenizer_path))
+        tokenizer = Tokenizer(WordLevel(unk_token="[UNK]")) # 使用 WordLevel 分词器，将未知的 token 设置为 "[UNK]"，每个单词一个 token
+        tokenizer.pre_tokenizer = Whitespace() # 使用 Whitespace 分词器，将单词之间的空格作为分隔符
+        trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2) # 一个词至少出现2次才能被保留
+        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer) # 从数据集中获取所有句子，并使用训练器训练分词器
+        tokenizer.save(str(tokenizer_path)) # 保存分词器
     else:
         tokenizer = Tokenizer.from_file(str(tokenizer_path))
     return tokenizer
 
 def get_ds(config):
-    # It only has the train split, so we divide it overselves
-    ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train')
+    # It only has the train split, so we divide it ourselves
+    ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train', cache_dir=f"{config['cache_dir']}")
 
     # Build tokenizers
     tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
@@ -168,8 +172,9 @@ def get_ds(config):
     print(f'Max length of target sentence: {max_len_tgt}')
     
 
-    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
-    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True, num_workers=0)
+    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True, num_workers=0)
+
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
 
@@ -198,30 +203,40 @@ def train_model(config):
     train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
     model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
     # Tensorboard
-    writer = SummaryWriter(config['experiment_name'])
+    writer = SummaryWriter(config['experiment_name']) # 创建一个 SummaryWriter 对象，用于记录训练过程中的指标
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
 
     # If the user specified a model to preload before training, load it
+    # initial_epoch 表示训练起始的 epoch 计数器（从第0轮开始）
+    # 如果从检查点恢复训练，该值会被更新为上次中断的 epoch 数
     initial_epoch = 0
+    # global_step 表示全局训练步数计数器（每处理一个 batch 递增一次）
+    # 用于学习率调度、日志记录等需要精确到步的操作
     global_step = 0
     preload = config['preload']
+    # 如果 preload 为 'latest'，则加载最新的模型
+    # 如果 preload 为具体的 epoch 数，则加载该 epoch 的模型
+    # 如果 preload 为 None，则不加载任何模型
     model_filename = latest_weights_file_path(config) if preload == 'latest' else get_weights_file_path(config, preload) if preload else None
     if model_filename:
         print(f'Preloading model {model_filename}')
-        state = torch.load(model_filename)
-        model.load_state_dict(state['model_state_dict'])
-        initial_epoch = state['epoch'] + 1
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        global_step = state['global_step']
+        state = torch.load(model_filename) # 获取模型断点文件
+        model.load_state_dict(state['model_state_dict']) # 加载模型参数
+        initial_epoch = state['epoch'] + 1 # 更新初始 epoch 计数器
+        optimizer.load_state_dict(state['optimizer_state_dict']) # 加载优化器参数
+        global_step = state['global_step'] # 更新全局训练步数计数器
     else:
         print('No model to preload, starting from scratch')
 
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
     for epoch in range(initial_epoch, config['num_epochs']):
-        torch.cuda.empty_cache()
-        model.train()
+        if (device == 'cuda'):
+            torch.cuda.empty_cache()
+        elif (device == 'mps'):
+            torch.backends.mps.empty_cache()
+        model.train() # 设置模型为训练模式
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
         for batch in batch_iterator:
 
@@ -239,6 +254,11 @@ def train_model(config):
             label = batch['label'].to(device) # (B, seq_len)
 
             # Compute the loss using a simple cross entropy
+            # nn.CrossEntropyLoss 期望的输入是：
+            # 预测值：[N, C]，其中 N 是样本数，C 是类别数（词汇表大小）
+            # 标签：[N]，一维的类别索引
+            # proj_output.view(-1, tokenizer_tgt.get_vocab_size()) 的维度是 (B * seq_len, vocab_size)
+            # label.view(-1) 的维度是 (B * seq_len)
             loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
             batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
 
@@ -249,9 +269,8 @@ def train_model(config):
             # Backpropagate the loss
             loss.backward()
 
-            # Update the weights
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.step() # update the weights
+            optimizer.zero_grad(set_to_none=True) # clear the gradients, set_to_none=True 表示如果梯度为 None，则不进行任何操作 (效率更高)
 
             global_step += 1
 
@@ -267,8 +286,47 @@ def train_model(config):
             'global_step': global_step
         }, model_filename)
 
+# 辅助函数定义
+def calculate_wer(predicted, expected):
+    transformation = jiwer.Compose([
+        jiwer.ToLowerCase(),
+        jiwer.RemoveMultipleSpaces(),
+        jiwer.Strip(),
+        jiwer.SentencesToListOfWords(),
+    ])
+    wer = jiwer.wer(
+        expected, 
+        predicted, 
+        truth_transform=transformation, 
+        hypothesis_transform=transformation
+    )
+    return wer
+
+def calculate_cer(predicted, expected):
+    transformation = jiwer.Compose([
+        jiwer.ToLowerCase(),
+        jiwer.RemoveMultipleSpaces(),
+        jiwer.Strip(),
+        jiwer.SentencesToListOfWords(word_delimiter="")
+    ])
+    cer = jiwer.cer(
+        expected, 
+        predicted, 
+        truth_transform=transformation, 
+        hypothesis_transform=transformation
+    )
+    return cer
+
+def calculate_bleu(predicted, expected):
+    # 对每个句子分词
+    predicted_tokens = [pred.split() for pred in predicted]
+    expected_tokens = [[ref.split()] for ref in expected]
+    
+    # 计算整个语料库的BLEU分数
+    bleu_score = nltk.translate.bleu_score.corpus_bleu(expected_tokens, predicted_tokens)
+    return bleu_score
 
 if __name__ == '__main__':
-    warnings.filterwarnings("ignore")
-    config = get_config()
-    train_model(config)
+    warnings.filterwarnings("ignore") # 忽略警告
+    config = get_config() # 获取配置
+    train_model(config) # 训练模型

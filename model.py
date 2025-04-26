@@ -3,6 +3,7 @@ import torch.nn as nn
 import math
 
 class LayerNormalization(nn.Module):
+    # layer normalization 针对每个样本的每个特征进行 normalization
 
     def __init__(self, features: int, eps:float=10**-6) -> None:
         super().__init__()
@@ -11,6 +12,7 @@ class LayerNormalization(nn.Module):
         self.bias = nn.Parameter(torch.zeros(features)) # bias is a learnable parameter
 
     def forward(self, x):
+        # y = alpha * (x - mean) / (std + eps) + bias
         # x: (batch, seq_len, hidden_size)
          # Keep the dimension for broadcasting
         mean = x.mean(dim = -1, keepdim = True) # (batch, seq_len, 1)
@@ -56,6 +58,7 @@ class PositionalEncoding(nn.Module):
         # Create a vector of shape (seq_len)
         position = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1) # (seq_len, 1)
         # Create a vector of shape (d_model)
+        # 这里直接计算10000的-2i/d_model次方容易溢出，所以使用 exp 的技巧
         div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)) # (d_model / 2)
         # Apply sine to even indices
         pe[:, 0::2] = torch.sin(position * div_term) # sin(position * (10000 ** (2i / d_model))
@@ -96,11 +99,15 @@ class MultiHeadAttentionBlock(nn.Module):
         self.w_o = nn.Linear(d_model, d_model, bias=False) # Wo
         self.dropout = nn.Dropout(dropout)
 
+    # 使用静态方法，因为 attention 不依赖于任何类属性
+    # 可以直接通过类名调用
+    # 调用实例：MultiHeadAttentionBlock.attention(query, key, value, mask, dropout)
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):
         d_k = query.shape[-1]
         # Just apply the formula from the paper
         # (batch, h, seq_len, d_k) --> (batch, h, seq_len, seq_len)
+        # 矩阵乘法默认对最后两位维度进行
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
         if mask is not None:
             # Write a very low value (indicating -inf) to the positions where mask == 0
@@ -127,6 +134,8 @@ class MultiHeadAttentionBlock(nn.Module):
         
         # Combine all the heads together
         # (batch, h, seq_len, d_k) --> (batch, seq_len, h, d_k) --> (batch, seq_len, d_model)
+        # contiguous()：强制将张量的数据在内存中重新排列为物理连续（复制数据到新内存区域）
+        # .contiguous().view() 和 .reshape() 效果是一样的 (.reshape() 会自动使得内存连续)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
 
         # Multiply by Wo
@@ -167,9 +176,11 @@ class DecoderBlock(nn.Module):
         self.feed_forward_block = feed_forward_block
         self.residual_connections = nn.ModuleList([ResidualConnection(features, dropout) for _ in range(3)])
 
+    # src_mask的作用是为了屏蔽掉目标语言的 padding token
+    # tgt_mask的作用是为了屏蔽掉目标语言的 future token 和 padding token
     def forward(self, x, encoder_output, src_mask, tgt_mask):
         x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, tgt_mask))
-        x = self.residual_connections[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
+        x = self.residual_connections[1](x, lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask)) # q = x, k = v = encoder_output
         x = self.residual_connections[2](x, self.feed_forward_block)
         return x
     
@@ -185,6 +196,7 @@ class Decoder(nn.Module):
             x = layer(x, encoder_output, src_mask, tgt_mask)
         return self.norm(x)
 
+# 将 d_model 映射到 vocab_size (目标语言的词表大小)
 class ProjectionLayer(nn.Module):
 
     def __init__(self, d_model, vocab_size) -> None:
@@ -233,7 +245,7 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
     tgt_pos = PositionalEncoding(d_model, tgt_seq_len, dropout)
     
     # Create the encoder blocks
-    encoder_blocks = []
+    encoder_blocks = [] # 一个 ModuleList 存储 N 个 encoder block
     for _ in range(N):
         encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         feed_forward_block = FeedForwardBlock(d_model, d_ff, dropout)
@@ -241,7 +253,7 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
         encoder_blocks.append(encoder_block)
 
     # Create the decoder blocks
-    decoder_blocks = []
+    decoder_blocks = [] # 一个 ModuleList 存储 N 个 decoder block
     for _ in range(N):
         decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
         decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
@@ -257,9 +269,16 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int, src_seq_len: int
     projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
     
     # Create the transformer
+    # using all the components defined above
     transformer = Transformer(encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer)
     
     # Initialize the parameters
+    # 维度大于1的参数：主要是权重矩阵（例如线性层的权重）
+    # 例如：形状为 (d_model, d_ff) 的前馈网络权重
+    # 例如：形状为 (d_model, d_model) 的注意力投影矩阵
+    # 维度为1的参数：通常是偏置向量（bias）和一些标量参数
+    # 例如：LayerNormalization 中的 alpha 和 bias
+    # 这些参数通常使用零初始化或常数初始化更合适
     for p in transformer.parameters():
         if p.dim() > 1:
             nn.init.xavier_uniform_(p)
