@@ -2,7 +2,7 @@ from pathlib import Path
 
 def get_config():
     return {
-        "batch_size": 8,         # 批次大小
+        "batch_size": 24,         # 批次大小
         "num_epochs": 20,        # 训练轮数
         "lr": 1e-4,              # 学习率
         "seq_len": 500,          # 序列最大长度

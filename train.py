@@ -20,10 +20,12 @@ from tokenizers.models import WordLevel
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
-import nltk
-import jiwer
+import sacrebleu
+from torchmetrics.text import CharErrorRate, WordErrorRate
 
 from torch.utils.tensorboard import SummaryWriter
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '4, 5, 6, 7'
 
 def greedy_decode(model: Transformer, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
     sos_idx = tokenizer_tgt.token_to_id('[SOS]')
@@ -143,7 +145,7 @@ def get_or_build_tokenizer(config, ds, lang):
 
 def get_ds(config):
     # It only has the train split, so we divide it ourselves
-    ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train', cache_dir=f"{config['cache_dir']}")
+    ds_raw = load_dataset(path=f"{config['datasource']}", name=f"{config['lang_src']}-{config['lang_tgt']}", split='train', cache_dir=f"{config['cache_dir']}")
 
     # Build tokenizers
     tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
@@ -288,43 +290,36 @@ def train_model(config):
 # 辅助函数定义
 # 三个指标：WER、CER 和 BLEU
 def calculate_wer(predicted, expected):
-    transformation = jiwer.Compose([
-        jiwer.ToLowerCase(),
-        jiwer.RemoveMultipleSpaces(),
-        jiwer.Strip(),
-        jiwer.SentencesToListOfWords(),
-    ])
-    wer = jiwer.wer(
-        expected, 
-        predicted, 
-        truth_transform=transformation, 
-        hypothesis_transform=transformation
-    )
-    return wer
+    """使用torchmetrics计算WER"""
+    wer_metric = WordErrorRate()
+    if isinstance(predicted, list):
+        predicted = " ".join(predicted)
+    if isinstance(expected, list):
+        expected = " ".join(expected)
+    return wer_metric([predicted], [expected]).item()
 
 def calculate_cer(predicted, expected):
-    transformation = jiwer.Compose([
-        jiwer.ToLowerCase(),
-        jiwer.RemoveMultipleSpaces(),
-        jiwer.Strip(),
-        jiwer.SentencesToListOfWords(word_delimiter="")
-    ])
-    cer = jiwer.cer(
-        expected, 
-        predicted, 
-        truth_transform=transformation, 
-        hypothesis_transform=transformation
-    )
-    return cer
+    """使用torchmetrics计算CER"""
+    cer_metric = CharErrorRate()
+    if isinstance(predicted, list):
+        predicted = " ".join(predicted)
+    if isinstance(expected, list):
+        expected = " ".join(expected)
+    return cer_metric([predicted], [expected]).item()
 
 def calculate_bleu(predicted, expected):
-    # 对每个句子分词
-    predicted_tokens = [pred.split() for pred in predicted]
-    expected_tokens = [[ref.split()] for ref in expected]
+    """使用sacrebleu计算BLEU分数"""
+    # 处理输入格式
+    if isinstance(predicted, str):
+        predicted = [predicted]
+    if isinstance(expected, str):
+        expected = [[expected]]
+    else:
+        expected = [[ref] for ref in expected]
     
-    # 计算整个语料库的BLEU分数
-    bleu_score = nltk.translate.bleu_score.corpus_bleu(expected_tokens, predicted_tokens)
-    return bleu_score
+    # 计算BLEU分数
+    bleu = sacrebleu.corpus_bleu(predicted, expected)
+    return bleu.score / 100.0  # sacrebleu返回0-100的分数，转换为0-1
 
 if __name__ == '__main__':
     warnings.filterwarnings("ignore") # 忽略警告
