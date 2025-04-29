@@ -12,6 +12,7 @@ import warnings
 from tqdm import tqdm
 import os
 from pathlib import Path
+import gc
 
 # Huggingface datasets and tokenizers
 from datasets import load_dataset
@@ -24,6 +25,9 @@ import sacrebleu
 from torchmetrics.text import CharErrorRate, WordErrorRate
 
 from torch.utils.tensorboard import SummaryWriter
+
+# 设置 CUDA 内存分配器配置以减少内存碎片
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:64'
 
 os.environ['CUDA_VISIBLE_DEVICES'] = '4, 5, 6, 7'
 
@@ -233,11 +237,9 @@ def train_model(config):
     loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
 
     for epoch in range(initial_epoch, config['num_epochs']):
-        if (device == 'cuda'):
-            torch.cuda.empty_cache()
-        elif (device == 'mps'):
-            torch.backends.mps.empty_cache()
-        model.train() # 设置模型为训练模式
+        torch.cuda.empty_cache()
+        gc.collect()  # 添加 Python 的垃圾回收
+        model.train()
         batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
         for batch in batch_iterator:
 
@@ -277,6 +279,8 @@ def train_model(config):
 
         # Run validation at the end of every epoch
         run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        torch.cuda.empty_cache()
+        gc.collect()
 
         # Save the model at the end of every epoch
         model_filename = get_weights_file_path(config, f"{epoch:02d}")

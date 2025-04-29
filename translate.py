@@ -6,6 +6,8 @@ from datasets import load_dataset
 from dataset import BilingualDataset
 import torch
 import sys
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = '7'
 
 def translate(sentence: str):
     # Define the device, tokenizers, and model
@@ -76,4 +78,4 @@ def translate(sentence: str):
     return tokenizer_tgt.decode(decoder_input[0].tolist())
     
 #read sentence from argument
-translate(sys.argv[1] if len(sys.argv) > 1 else "I am not a very good a student.")
+translate(sys.argv[1] if len(sys.argv) > 1 else "I am not a very good student.")
